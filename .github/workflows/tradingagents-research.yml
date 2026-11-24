@@ -1,0 +1,143 @@
+name: TradingAgents Research Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Comma-separated Yahoo Finance symbols. Default runs Gold, RateGain and Bajaj Finance."
+        required: true
+        type: string
+        default: "GOLD,RATEGAIN.NS,BAJFINANCE.NS"
+      analysis_date:
+        description: "Analysis date (YYYY-MM-DD). Leave blank to use today's India date."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tradingagents-manual-run
+  cancel-in-progress: false
+
+jobs:
+  research:
+    name: Run TradingAgents
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      TRADINGAGENTS_LLM_PROVIDER: openai
+      TRADINGAGENTS_DEEP_THINK_LLM: gpt-6-sol
+      TRADINGAGENTS_QUICK_THINK_LLM: gpt-6-luna
+      TRADINGAGENTS_OUTPUT_LANGUAGE: English
+      TRADINGAGENTS_MAX_DEBATE_ROUNDS: "1"
+      TRADINGAGENTS_MAX_RISK_ROUNDS: "1"
+      TRADINGAGENTS_RESULTS_DIR: results
+      TRADINGAGENTS_NO_UPDATE_CHECK: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Validate inputs and API credentials
+        id: inputs
+        shell: bash
+        env:
+          REQUESTED_TICKERS: ${{ inputs.tickers }}
+          REQUESTED_DATE: ${{ inputs.analysis_date }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "::error title=Missing GitHub secret::Add OPENAI_API_KEY under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          TICKERS="$(echo "$REQUESTED_TICKERS" | tr -d '[:space:]')"
+          if [[ -z "$TICKERS" ]]; then
+            echo "::error::At least one ticker is required."
+            exit 1
+          fi
+
+          IFS=',' read -ra SYMBOLS <<< "$TICKERS"
+          for ticker in "${SYMBOLS[@]}"; do
+            if [[ ! "$ticker" =~ ^[A-Za-z0-9._^=+-]+$ ]]; then
+              echo "::error::Invalid ticker format: $ticker"
+              exit 1
+            fi
+          done
+
+          if [[ -n "$REQUESTED_DATE" ]]; then
+            if [[ ! "$REQUESTED_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::Analysis date must use YYYY-MM-DD."
+              exit 1
+            fi
+            ANALYSIS_DATE="$REQUESTED_DATE"
+          else
+            ANALYSIS_DATE="$(TZ=Asia/Kolkata date +%F)"
+          fi
+
+          echo "tickers=$TICKERS" >> "$GITHUB_OUTPUT"
+          echo "analysis_date=$ANALYSIS_DATE" >> "$GITHUB_OUTPUT"
+          echo "Analysis date: $ANALYSIS_DATE"
+          echo "Tickers requested: ${#SYMBOLS[@]}"
+
+      - name: Install TradingAgents
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Run requested analyses
+        shell: bash
+        env:
+          TICKERS: ${{ steps.inputs.outputs.tickers }}
+          ANALYSIS_DATE: ${{ steps.inputs.outputs.analysis_date }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra SYMBOLS <<< "$TICKERS"
+
+          for ticker in "${SYMBOLS[@]}"; do
+            echo "::group::TradingAgents analysis: $ticker ($ANALYSIS_DATE)"
+
+            # Gold is mapped by the repository's symbol normalizer to the
+            # COMEX gold future (GC=F). It is not a company, so omit fundamentals.
+            case "${ticker^^}" in
+              GOLD|XAU|XAUUSD|GC=F)
+                analysts="market,sentiment,news"
+                ;;
+              *)
+                analysts="market,sentiment,news,fundamentals"
+                ;;
+            esac
+
+            echo "Ticker: $ticker"
+            echo "Analysts: $analysts"
+            tradingagents \
+              --ticker "$ticker" \
+              --date "$ANALYSIS_DATE" \
+              --analysts "$analysts" \
+              --save \
+              --no-show \
+              --html
+
+            echo "::endgroup::"
+          done
+
+      - name: Upload analysis reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-reports-${{ github.run_number }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
